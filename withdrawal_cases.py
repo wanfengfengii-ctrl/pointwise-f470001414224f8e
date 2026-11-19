@@ -4,10 +4,12 @@ import json
 from contextlib import closing
 
 from freeze import close_day, open_successor
+from freeze.history import FrozenRevision, read_revision
 from intake import add_node, create_draft, open_source, record, withdraw_record
-from publish import publish_pack
-from results import issue, open_night
-from review import ReviewRequest, import_pack
+from publish import publish_pack, withdrawal_notice, withdrawal_sheet
+from publish.eligibility import build_eligibility
+from results import issue, open_night, review_withdrawals
+from review import ReviewRequest, import_pack, import_withdrawal_notice, import_withdrawal_sheet
 from samples import BATCH, FRONT, FRONT_BOUNDARIES, REAR, REAR_BOUNDARIES, SAMPLES, stage_front, stage_rear
 
 
@@ -90,5 +92,93 @@ def check_reference():
     }
 
 
+def withdrawn_front_evidence(frozen, removed):
+    kept = tuple(item for item in frozen.transfers if item.record_id not in removed)
+    return build_eligibility(FrozenRevision(
+        frozen.station, frozen.batch, frozen.revision, frozen.draft,
+        frozen.base_revision, frozen.nodes, kept, frozen.boundaries,
+    ))
+
+
+def check_withdrawal_wire():
+    """Compare the implemented withdrawal review with a V1 reduced-record recut."""
+    observations = []
+    for spare in (False, True):
+        for removed in ((), ("private-r",), ("private-s",), ("private-r", "private-s")):
+            with closing(open_source(":memory:")) as prep, closing(open_source(":memory:")) as lab:
+                front_pack = stage_withdrawal_front(prep, spare=spare)
+                rear_pack = stage_fallback_rear(lab)
+                front_sheet = withdrawal_sheet(prep, (FRONT, BATCH, "R1"))
+                rear_sheet = withdrawal_sheet(lab, (REAR, BATCH, "R1"))
+                notices = [
+                    withdrawal_notice(prep, (FRONT, BATCH, "R1"), f"notice-{index}", [name])
+                    for index, name in enumerate(removed)
+                ]
+                frozen = read_revision(prep, (FRONT, BATCH, "R1"))
+                rear_frozen = read_revision(lab, (REAR, BATCH, "R1"))
+            reference_front = withdrawn_front_evidence(frozen, set(removed))
+            reference_rear = build_eligibility(rear_frozen)
+            upstream = tuple((sample.start, port) for sample, port in zip(SAMPLES, ("p", "q")))
+            downstream = tuple((port, sample.end) for sample, port in zip(SAMPLES, ("p", "q")))
+            if not removed:
+                expected = "NO_WITHDRAWAL_NOTICE"
+            elif reference_front.allows_pair(*upstream) and reference_rear.allows_pair(*downstream):
+                expected = "valid"
+            else:
+                expected = "invalid"
+            with closing(open_night(":memory:")) as night:
+                front_id = import_pack(night, front_pack)
+                rear_id = import_pack(night, rear_pack)
+                result = issue(night, ReviewRequest(front_id, rear_id, SAMPLES))
+                import_withdrawal_sheet(night, front_sheet)
+                import_withdrawal_sheet(night, rear_sheet)
+                for notice in reversed(notices):
+                    import_withdrawal_notice(night, notice)
+                if removed:
+                    review = review_withdrawals(night, result.result_id)
+                else:
+                    try:
+                        review_withdrawals(night, result.result_id)
+                    except LookupError as exc:
+                        review = {"status": str(exc), "interfaces": list(result.interfaces)}
+                    else:
+                        raise AssertionError("review without notice should be refused")
+            assert review["status"] == expected, (spare, removed, review["status"], expected)
+            observations.append({
+                "spare_to_p": spare, "removed": list(removed),
+                "interfaces": review["interfaces"], "status": review["status"],
+            })
+
+    with closing(open_source(":memory:")) as prep, closing(open_source(":memory:")) as lab:
+        front_pack = stage_front(prep, "D1", "R1", parallel=True)
+        rear_pack = stage_rear(lab)
+        front_sheet = withdrawal_sheet(prep, (FRONT, BATCH, "R1"))
+        rear_sheet = withdrawal_sheet(lab, (REAR, BATCH, "R1"))
+        notice = withdrawal_notice(prep, (FRONT, BATCH, "R1"), "drop-r1", ["r1"])
+        frozen = read_revision(prep, (FRONT, BATCH, "R1"))
+    reference = withdrawn_front_evidence(frozen, {"r1"})
+    with closing(open_night(":memory:")) as night:
+        front_id = import_pack(night, front_pack)
+        rear_id = import_pack(night, rear_pack)
+        result = issue(night, ReviewRequest(front_id, rear_id, SAMPLES))
+        import_withdrawal_sheet(night, front_sheet)
+        import_withdrawal_sheet(night, rear_sheet)
+        import_withdrawal_notice(night, notice)
+        joint = review_withdrawals(night, result.result_id)
+        singles = []
+        for sample in SAMPLES:
+            each = review_withdrawals(night, issue(
+                night, ReviewRequest(front_id, rear_id, (sample,)),
+            ).result_id)
+            singles.append(each["status"])
+    assert joint["status"] == "invalid", joint
+    assert singles == ["valid", "valid"], singles
+    assert reference.allows_pair(*[(s.start, s.end) for s in SAMPLES]) is False
+    return {"fresh_withdrawal_reviews": observations,
+            "shared_remaining": {"joint": joint["status"], "singles": singles}}
+
+
 if __name__ == "__main__":
-    print(json.dumps(check_reference(), indent=2))
+    report = check_reference()
+    report["withdrawal_wire"] = check_withdrawal_wire()
+    print(json.dumps(report, indent=2))

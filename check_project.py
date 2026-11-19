@@ -1,9 +1,9 @@
-"""Run this project's full unittest suite from the repository root."""
+"""Run this project's full unittest suite and the V1 reference checks."""
 import sys
 import unittest
 
 
-def main():
+def run_suite():
     suite = unittest.defaultTestLoader.discover('tests', top_level_dir='.')
     if suite.countTestCases():
         result = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -24,6 +24,23 @@ def main():
           f'unexpected_successes={len(result.unexpectedSuccesses)} '
           f'result={"PASS" if successful else "FAIL"}')
     return 0 if successful else 1
+
+
+def run_reference_checks():
+    from withdrawal_cases import check_reference, check_withdrawal_wire
+
+    try:
+        check_reference()
+        check_withdrawal_wire()
+    except BaseException as exc:  # propagate the project's own failure style
+        print(f'REFERENCE SUMMARY result=FAIL error={type(exc).__name__}: {exc}')
+        return 1
+    print('REFERENCE SUMMARY result=PASS')
+    return 0
+
+
+def main():
+    return run_suite() | run_reference_checks()
 
 
 if __name__ == '__main__':

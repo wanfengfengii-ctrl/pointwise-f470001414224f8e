@@ -2,6 +2,7 @@ import sqlite3
 from contextlib import contextmanager
 
 from review.intake import initialize_imports
+from review.withdrawals import initialize_withdrawals
 
 
 @contextmanager
@@ -26,6 +27,12 @@ def initialize_results(db):
             receipt_id TEXT NOT NULL UNIQUE
         )
     ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS withdrawal_reviews (
+            review_id INTEGER PRIMARY KEY,
+            snapshot TEXT NOT NULL
+        )
+    ''')
 
 
 def initialize_night(db):
@@ -34,6 +41,7 @@ def initialize_night(db):
     db.execute('PRAGMA foreign_keys = ON')
     with issue_transaction(db):
         initialize_imports(db)
+        initialize_withdrawals(db)
         initialize_results(db)
 
 
